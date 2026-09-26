@@ -5,7 +5,7 @@ import asyncio
 import contextlib
 import logging
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 
 from .config import settings
 from .engine import SamplingEngine
@@ -14,6 +14,7 @@ from .models import (
     BatchDecisionResponse,
     BatchIngestRequest,
     BatchIngestResponse,
+    ConcurrencyResponse,
     DecisionResponse,
     ServiceTimeResponse,
     StatsResponse,
@@ -86,6 +87,7 @@ def root() -> dict[str, str]:
         "ingest": "POST /api/v1/spans:batch",
         "decisions": "GET /api/v1/decisions/{trace_id}",
         "service_time": "GET /api/v1/traces/{trace_id}/service-time",
+        "concurrency": "GET /api/v1/traces/{trace_id}/concurrency",
     }
 
 
@@ -143,6 +145,26 @@ def get_service_time(trace_id: str) -> ServiceTimeResponse:
     if view is None:
         raise HTTPException(status_code=404, detail="trace not found")
     return ServiceTimeResponse(**view)
+
+
+@app.get(
+    "/api/v1/traces/{trace_id}/concurrency",
+    response_model=ConcurrencyResponse,
+    tags=["traces"],
+    summary="Windows where one trace runs several spans at once",
+)
+def get_concurrency(
+    trace_id: str,
+    min_active: int = Query(
+        2,
+        ge=2,
+        description="Minimum number of simultaneously active spans to report",
+    ),
+) -> ConcurrencyResponse:
+    view = get_engine().get_concurrency(trace_id, min_active)
+    if view is None:
+        raise HTTPException(status_code=404, detail="trace not found")
+    return ConcurrencyResponse(**view)
 
 
 @app.get("/api/v1/stats", response_model=StatsResponse, tags=["admin"])

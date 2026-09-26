@@ -212,6 +212,51 @@ curl -s http://localhost:8080/api/v1/traces/abc-123/service-time
 `services` is sorted by `exclusive_ns` descending, then service name
 ascending with the `null` group last. Unknown trace id → `404`.
 
+### `GET /api/v1/traces/{trace_id}/concurrency` — concurrent-span windows
+
+Locates the time ranges inside one trace where several spans are running at
+once. The stored spans are half-open nanosecond intervals `[start, end)`; a
+span ending at the same instant another starts does **not** count as overlap,
+and zero-length spans are ignored. The sweep line returns every merged range
+in which at least `min_active` spans are active — ranges that touch at a
+single instant come back merged, ranges separated by a real (positive-length)
+gap stay apart — together with each range's peak concurrency and the total
+time covered. Works on open traces too, from a consistent snapshot taken
+inside the engine lock.
+
+```bash
+curl -s 'http://localhost:8080/api/v1/traces/4bf92f3577b34da6a3ce929d0e0e4736/concurrency?min_active=2'
+```
+
+```json
+{
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "min_active": 2,
+  "span_count": 4,
+  "window_count": 2,
+  "total_ns": 14000000,
+  "max_active": 3,
+  "windows": [
+    {
+      "start_ns": 1789716000100000000,
+      "end_ns": 1789716000112000000,
+      "peak_active": 3,
+      "duration_ns": 12000000
+    },
+    {
+      "start_ns": 1789716000300000000,
+      "end_ns": 1789716000302000000,
+      "peak_active": 2,
+      "duration_ns": 2000000
+    }
+  ]
+}
+```
+
+* `min_active` defaults to `2`; values below 2 → `422`.
+* `windows` is ordered by `start_ns`; `total_ns` is the sum of the merged
+  window lengths. Unknown trace id → `404`.
+
 ### Other endpoints
 
 | Method & path | Purpose |
@@ -282,5 +327,6 @@ pytest -q
 
 The test suite covers priority budget saturation, slow/error classification,
 stable-hash fill counts, determinism, duplicate/late span handling, batch
-queries, timestamp formats, per-service exclusive-time computation, and crash
-recovery from SQLite.
+queries, timestamp formats, per-service exclusive-time computation,
+concurrent-span window detection (half-open endpoints, adjacent merging,
+zero-length spans, threshold validation), and crash recovery from SQLite.

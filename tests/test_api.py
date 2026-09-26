@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app.sampler import select_by_hash, stable_hash
 
 
@@ -259,6 +261,120 @@ def test_service_time_after_close_handles_null_group_and_overlaps(client):
         {"service": "b", "span_count": 2, "exclusive_ns": 80_000_000},
         {"service": "a", "span_count": 2, "exclusive_ns": 30_000_000},
         {"service": None, "span_count": 1, "exclusive_ns": 5_000_000},
+    ]
+
+
+def test_concurrency_unknown_trace_returns_404(client):
+    resp = client.get("/api/v1/traces/no-such-trace/concurrency")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "trace not found"
+
+
+@pytest.mark.parametrize("bad", ["1", "0", "-3"])
+def test_concurrency_threshold_below_two_returns_422(client, bad):
+    resp = client.get(
+        "/api/v1/traces/whatever/concurrency", params={"min_active": bad}
+    )
+    assert resp.status_code == 422
+
+
+def test_concurrency_for_open_trace_uses_current_snapshot(client):
+    tid = "cc-open"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        # Two spans overlap on [20ms, 50ms).
+        _custom_span(tid, "a", 0, 50, service="gateway"),
+        _custom_span(tid, "b", 20, 80, service="auth"),
+        # Zero-length span: counted, never active.
+        _custom_span(tid, "instant", 10, 10, service="auth"),
+    ]})
+
+    resp = client.get(f"/api/v1/traces/{tid}/concurrency")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["trace_id"] == tid
+    assert body["min_active"] == 2
+    assert body["span_count"] == 3
+    assert body["max_active"] == 2
+    assert body["window_count"] == 1
+    assert body["total_ns"] == 30_000_000
+    assert body["windows"] == [{
+        "start_ns": 1577840400_000_000_000 + 20_000_000,
+        "end_ns": 1577840400_000_000_000 + 50_000_000,
+        "peak_active": 2,
+        "duration_ns": 30_000_000,
+    }]
+
+    # A span arriving later is visible on re-query (consistent snapshot).
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "c", 30, 40, service="payments"),
+    ]})
+    body = client.get(f"/api/v1/traces/{tid}/concurrency").json()
+    assert body["span_count"] == 4
+    assert body["max_active"] == 3
+    assert body["windows"] == [{
+        "start_ns": 1577840400_000_000_000 + 30_000_000,
+        "end_ns": 1577840400_000_000_000 + 40_000_000,
+        "peak_active": 3,
+        "duration_ns": 10_000_000,
+    }]
+    assert body["total_ns"] == 10_000_000
+
+
+def test_concurrency_end_start_touch_and_adjacent_merge(client):
+    tid = "cc-touch"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        # b starts exactly when a ends: half-open intervals do not overlap.
+        _custom_span(tid, "a", 0, 10, service="s"),
+        _custom_span(tid, "b", 10, 20, service="s"),
+    ]})
+    body = client.get(f"/api/v1/traces/{tid}/concurrency").json()
+    assert body["windows"] == []
+    assert body["max_active"] == 1
+    assert body["total_ns"] == 0
+
+    # A third span bridges across: overlap on [0,10) and [10,20) join at the
+    # single instant t=10, so they come back as one merged window.
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "bridge", 5, 15, service="s"),
+    ]})
+    body = client.get(f"/api/v1/traces/{tid}/concurrency").json()
+    assert body["window_count"] == 1
+    assert body["windows"] == [{
+        "start_ns": 1577840400_000_000_000 + 5_000_000,
+        "end_ns": 1577840400_000_000_000 + 15_000_000,
+        "peak_active": 2,
+        "duration_ns": 10_000_000,
+    }]
+    assert body["total_ns"] == 10_000_000
+
+
+def test_concurrency_custom_threshold_and_gap_splitting(client):
+    tid = "cc-threshold"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "a", 0, 30, service="s"),
+        _custom_span(tid, "b", 5, 10, service="s"),
+        _custom_span(tid, "c", 5, 10, service="s"),
+        _custom_span(tid, "d", 20, 30, service="s"),
+    ]})
+
+    # min_active=3: only [5,10) holds three spans.
+    body = client.get(
+        f"/api/v1/traces/{tid}/concurrency", params={"min_active": 3}
+    ).json()
+    assert body["min_active"] == 3
+    assert body["window_count"] == 1
+    assert body["windows"][0]["peak_active"] == 3
+    assert body["windows"][0]["duration_ns"] == 5_000_000
+    assert body["total_ns"] == 5_000_000
+
+    # min_active=2 (explicit): [5,10) and [20,30) separated by a real gap.
+    body = client.get(
+        f"/api/v1/traces/{tid}/concurrency", params={"min_active": 2}
+    ).json()
+    assert body["window_count"] == 2
+    assert body["total_ns"] == 15_000_000
+    assert [w["duration_ns"] for w in body["windows"]] == [
+        5_000_000, 10_000_000
     ]
 
 

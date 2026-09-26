@@ -19,6 +19,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+from . import concurrency
 from . import sampler
 from . import servicetime
 from .config import Settings
@@ -379,6 +380,22 @@ class SamplingEngine:
                 "span_count": len(rows),
                 "services": servicetime.exclusive_by_service(rows),
             }
+
+    def get_concurrency(self, tid: str, min_active: int) -> dict[str, Any] | None:
+        """Merged concurrent-span windows from one consistent snapshot.
+
+        Works for decided and open traces alike; for open traces the snapshot
+        spans exactly what has been received at query time (the engine lock
+        serializes against ingest). Returns None for unknown traces.
+        """
+        with self._lock:
+            if self.storage.get_trace(tid) is None:
+                return None
+            rows = list(self.storage.iter_span_rows(tid))
+            result = concurrency.concurrency_windows(rows, min_active)
+            result["trace_id"] = tid
+            result["min_active"] = min_active
+            return result
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

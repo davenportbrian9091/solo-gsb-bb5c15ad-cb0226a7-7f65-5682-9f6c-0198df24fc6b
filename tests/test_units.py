@@ -6,6 +6,7 @@ import pytest
 from app.timeutil import minute_bucket, to_ns
 from app.sampler import hash_score, select_by_hash, stable_hash
 from app.servicetime import exclusive_by_service, _union_length
+from app.concurrency import concurrency_windows
 from app.models import SpanIn
 from pydantic import ValidationError
 
@@ -186,3 +187,96 @@ def test_select_by_hash_exact_counts_and_stability():
     assert kept == [] and len(dropped) == 20
     kept, dropped = select_by_hash(ids, 100)
     assert len(kept) == 20 and dropped == []
+
+
+def _iv(rows):
+    return [{"start_ns": a, "end_ns": b} for a, b in rows]
+
+
+def test_concurrency_basic_overlap_window():
+    result = concurrency_windows(_iv([(0, 10), (5, 20)]))
+    assert result["window_count"] == 1
+    assert result["total_ns"] == 5
+    assert result["max_active"] == 2
+    assert result["windows"] == [
+        {"start_ns": 5, "end_ns": 10, "peak_active": 2, "duration_ns": 5}
+    ]
+
+
+def test_concurrency_end_start_touch_does_not_overlap():
+    # Half-open [start,end): the second starts exactly when the first ends.
+    assert concurrency_windows(_iv([(0, 10), (10, 20)]))["windows"] == []
+    # Even with a third span, the touching point only stays (or dips) —
+    # active is 1 at t=10 but never 2 there.
+    result = concurrency_windows(_iv([(0, 10), (10, 20), (10, 30)]))
+    assert result["windows"] == [
+        {"start_ns": 10, "end_ns": 20, "peak_active": 2, "duration_ns": 10}
+    ]
+
+
+def test_concurrency_adjacent_windows_merge_through_instant_dip():
+    # A,B overlap on [0,10); B continues and C starts at t=10, overlapping on
+    # [10,20). Active is below 2 only at the single instant t=10 -> merged.
+    result = concurrency_windows(_iv([(0, 10), (0, 20), (10, 20)]))
+    assert result["window_count"] == 1
+    assert result["windows"] == [
+        {"start_ns": 0, "end_ns": 20, "peak_active": 2, "duration_ns": 20}
+    ]
+    assert result["total_ns"] == 20
+
+
+def test_concurrency_positive_gap_splits_windows():
+    result = concurrency_windows(
+        _iv([(0, 10), (5, 10), (15, 20), (15, 25)])
+    )
+    assert result["window_count"] == 2
+    assert result["total_ns"] == 10
+    assert [w["start_ns"] for w in result["windows"]] == [5, 15]
+
+
+def test_concurrency_nested_spans_track_peak():
+    result = concurrency_windows(_iv([(0, 100), (10, 90), (20, 80)]))
+    assert result["max_active"] == 3
+    # Qualifying at depth >= 2 from t=10; peak 3 on the nested core.
+    assert result["windows"] == [
+        {"start_ns": 10, "end_ns": 90, "peak_active": 3, "duration_ns": 80}
+    ]
+
+
+def test_concurrency_peak_is_max_across_merged_window():
+    # Two overlap regions joined at an instant: peaks 3 then 2.
+    result = concurrency_windows(
+        _iv([(0, 10), (0, 10), (0, 5), (10, 20), (10, 20)])
+    )
+    assert result["window_count"] == 1
+    assert result["windows"][0]["start_ns"] == 0
+    assert result["windows"][0]["end_ns"] == 20
+    assert result["windows"][0]["peak_active"] == 3
+    assert result["total_ns"] == 20
+
+
+def test_concurrency_zero_length_spans_are_ignored():
+    result = concurrency_windows(_iv([(0, 0), (0, 10), (10, 20), (20, 20)]))
+    assert result["span_count"] == 4
+    assert result["max_active"] == 1
+    assert result["windows"] == []
+    assert concurrency_windows(_iv([(5, 5)]))["windows"] == []
+
+
+def test_concurrency_custom_threshold():
+    rows = _iv([(0, 10), (2, 8)])
+    assert concurrency_windows(rows, min_active=2)["window_count"] == 1
+    assert concurrency_windows(rows, min_active=3)["windows"] == []
+    assert concurrency_windows(rows, min_active=3)["max_active"] == 2
+
+
+def test_concurrency_empty_and_sorted_output():
+    result = concurrency_windows([])
+    assert result == {
+        "span_count": 0, "window_count": 0, "total_ns": 0,
+        "max_active": 0, "windows": [],
+    }
+    # Input order does not matter; windows come back ordered by start.
+    shuffled = _iv([(30, 40), (0, 10), (30, 45), (0, 8)])
+    starts = [w["start_ns"] for w in concurrency_windows(shuffled)["windows"]]
+    assert starts == sorted(starts) == [0, 30]

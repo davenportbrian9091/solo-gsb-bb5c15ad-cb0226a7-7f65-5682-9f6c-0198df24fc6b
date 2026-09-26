@@ -99,6 +99,27 @@ class ServiceTimeResponse(BaseModel):
     services: list[ServiceTimeEntry]
 
 
+class ConcurrencyWindow(BaseModel):
+    # Half-open [start_ns, end_ns) range with at least min_active live spans.
+    start_ns: int
+    end_ns: int
+    peak_active: int
+    duration_ns: int
+
+
+class ConcurrencyResponse(BaseModel):
+    trace_id: str
+    min_active: int
+    span_count: int
+    window_count: int
+    # Total ns covered by the merged qualifying windows.
+    total_ns: int
+    # Highest number of simultaneously active spans anywhere in the trace
+    # (0 when only zero-length spans are stored).
+    max_active: int
+    windows: list[ConcurrencyWindow]
+
+
 class StatsResponse(BaseModel):
     open_traces: int
     pending_normal: int
