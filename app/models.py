@@ -99,6 +99,23 @@ class ServiceTimeResponse(BaseModel):
     services: list[ServiceTimeEntry]
 
 
+class ConcurrencyWindow(BaseModel):
+    start_ns: int
+    end_ns: int
+    duration_ns: int
+    peak_active: int
+
+
+class ConcurrencyResponse(BaseModel):
+    trace_id: str
+    min_active: int
+    span_count: int
+    window_count: int
+    # Total time (ns) with at least `min_active` spans active at once.
+    total_concurrent_ns: int
+    windows: list[ConcurrencyWindow]
+
+
 class StatsResponse(BaseModel):
     open_traces: int
     pending_normal: int

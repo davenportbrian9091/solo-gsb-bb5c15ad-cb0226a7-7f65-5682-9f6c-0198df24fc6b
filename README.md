@@ -212,6 +212,44 @@ curl -s http://localhost:8080/api/v1/traces/abc-123/service-time
 `services` is sorted by `exclusive_ns` descending, then service name
 ascending with the `null` group last. Unknown trace id → `404`.
 
+### `GET /api/v1/traces/{trace_id}/concurrency?min_active=2` — concurrent-span windows
+
+Finds the time windows inside one trace where at least `min_active` spans
+were running at the same time. The stored nanosecond `[start, end)` span
+intervals are swept for the active-span count; intervals are half-open, so a
+span ending exactly where another starts does **not** create a false overlap,
+stretches that stay at or above the threshold merge into one continuous
+window, and zero-length spans never count. Works on open traces too — they
+are computed from a consistent snapshot of the spans received so far.
+
+```bash
+curl -s "http://localhost:8080/api/v1/traces/abc-123/concurrency?min_active=2"
+```
+
+```json
+{
+  "trace_id": "abc-123",
+  "min_active": 2,
+  "span_count": 4,
+  "window_count": 1,
+  "total_concurrent_ns": 40000000000,
+  "windows": [
+    {
+      "start_ns": 1780000040000000000,
+      "end_ns": 1780000080000000000,
+      "duration_ns": 40000000000,
+      "peak_active": 2
+    }
+  ]
+}
+```
+
+* `windows` — merged qualifying intervals, sorted by start, each with its
+  `peak_active` (highest simultaneous span count inside the window).
+* `total_concurrent_ns` — total time at or above the threshold.
+* `min_active` defaults to `2`; values below 2 → `422`. Unknown trace id →
+  `404`.
+
 ### Other endpoints
 
 | Method & path | Purpose |
@@ -282,5 +320,5 @@ pytest -q
 
 The test suite covers priority budget saturation, slow/error classification,
 stable-hash fill counts, determinism, duplicate/late span handling, batch
-queries, timestamp formats, per-service exclusive-time computation, and crash
-recovery from SQLite.
+queries, timestamp formats, per-service exclusive-time computation,
+concurrent-span window detection, and crash recovery from SQLite.

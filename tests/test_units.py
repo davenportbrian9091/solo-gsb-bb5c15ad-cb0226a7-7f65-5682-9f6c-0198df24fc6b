@@ -6,6 +6,7 @@ import pytest
 from app.timeutil import minute_bucket, to_ns
 from app.sampler import hash_score, select_by_hash, stable_hash
 from app.servicetime import exclusive_by_service, _union_length
+from app.concurrency import active_windows
 from app.models import SpanIn
 from pydantic import ValidationError
 
@@ -119,6 +120,79 @@ def test_nested_spans_exclusive_sums_to_wall_clock_length():
     assert result["a"]["exclusive_ns"] == 20
     assert result["b"]["exclusive_ns"] == 20
     assert result["c"]["exclusive_ns"] == 60
+
+
+def test_active_windows_basic_overlap_and_peak():
+    rows = [
+        _row("a", 0, 10),
+        _row("b", 2, 8),
+        _row("c", 4, 6),
+    ]
+    # active: 1@0, 2@2, 3@4, 2@6, 1@8, 0@10 -> one window [2, 8), peak 3.
+    assert active_windows(rows, 2) == [
+        {"start_ns": 2, "end_ns": 8, "duration_ns": 6, "peak_active": 3}
+    ]
+
+
+def test_active_windows_touching_endpoints_do_not_overlap():
+    # Half-open [start, end): b starts exactly where a ends.
+    rows = [_row("a", 0, 10), _row("b", 10, 20)]
+    assert active_windows(rows, 2) == []
+
+
+def test_active_windows_adjacent_qualifying_stretches_merge():
+    # a ends where c starts (no false overlap), but b keeps the count at 2
+    # across the seam at t=10, so [5, 15) is one continuous window.
+    rows = [
+        _row("a", 0, 10),
+        _row("b", 5, 15),
+        _row("c", 10, 20),
+    ]
+    assert active_windows(rows, 2) == [
+        {"start_ns": 5, "end_ns": 15, "duration_ns": 10, "peak_active": 2}
+    ]
+
+
+def test_active_windows_separate_windows_and_min_active_threshold():
+    rows = [
+        _row("a", 0, 10),
+        _row("b", 2, 4),
+        _row("c", 20, 30),
+        _row("d", 22, 28),
+        _row("e", 24, 26),
+    ]
+    assert active_windows(rows, 2) == [
+        {"start_ns": 2, "end_ns": 4, "duration_ns": 2, "peak_active": 2},
+        {"start_ns": 22, "end_ns": 28, "duration_ns": 6, "peak_active": 3},
+    ]
+    # With a threshold of 3 only the second stretch qualifies.
+    assert active_windows(rows, 3) == [
+        {"start_ns": 24, "end_ns": 26, "duration_ns": 2, "peak_active": 3}
+    ]
+    # Nothing ever reaches 4.
+    assert active_windows(rows, 4) == []
+
+
+def test_active_windows_zero_duration_spans_are_ignored():
+    rows = [
+        _row("a", 0, 10),
+        _row("instant", 5, 5),   # empty interval: never active
+        _row("b", 5, 5),
+    ]
+    assert active_windows(rows, 2) == []
+
+
+def test_active_windows_identical_spans_and_empty_input():
+    assert active_windows([], 2) == []
+    rows = [_row("a", 0, 10), _row("b", 0, 10)]
+    assert active_windows(rows, 2) == [
+        {"start_ns": 0, "end_ns": 10, "duration_ns": 10, "peak_active": 2}
+    ]
+
+
+def test_active_windows_rejects_min_active_below_two():
+    with pytest.raises(ValueError):
+        active_windows([_row("a", 0, 10)], 1)
 
 
 def test_epoch_units_are_normalized_to_ns():

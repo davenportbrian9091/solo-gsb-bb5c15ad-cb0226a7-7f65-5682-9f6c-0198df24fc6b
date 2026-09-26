@@ -262,6 +262,123 @@ def test_service_time_after_close_handles_null_group_and_overlaps(client):
     ]
 
 
+def test_concurrency_unknown_trace_returns_404(client):
+    resp = client.get("/api/v1/traces/no-such-trace/concurrency")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "trace not found"
+
+
+def test_concurrency_min_active_below_two_is_422(client):
+    tid = "cc-validation"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "a", 0, 100, service="svc"),
+    ]})
+    resp = client.get(f"/api/v1/traces/{tid}/concurrency?min_active=1")
+    assert resp.status_code == 422
+    # Non-integer thresholds are rejected the same way.
+    resp = client.get(f"/api/v1/traces/{tid}/concurrency?min_active=abc")
+    assert resp.status_code == 422
+
+
+def test_concurrency_windows_peak_and_total(client):
+    tid = "cc-basic"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "a", 0, 100, service="svc"),
+        _custom_span(tid, "b", 20, 80, service="svc"),
+        _custom_span(tid, "c", 40, 60, service="svc"),
+        # Zero-duration span: must not affect the sweep.
+        _custom_span(tid, "instant", 50, 50, service="svc"),
+        # Touching endpoints: starts exactly where a ends, no overlap with a.
+        _custom_span(tid, "tail", 100, 150, service="svc"),
+    ]})
+
+    resp = client.get(f"/api/v1/traces/{tid}/concurrency")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["trace_id"] == tid
+    assert body["min_active"] == 2
+    assert body["span_count"] == 5
+    # Overlap of a/b/c is [20ms, 80ms) with peak 3 over [40ms, 60ms).
+    ms = 10**6
+    base_ns = 1577836800 * 10**9 + 60 * 60 * 10**9
+    assert body["windows"] == [{
+        "start_ns": base_ns + 20 * ms,
+        "end_ns": base_ns + 80 * ms,
+        "duration_ns": 60 * ms,
+        "peak_active": 3,
+    }]
+    assert body["window_count"] == 1
+    assert body["total_concurrent_ns"] == 60 * ms
+
+    # A stricter threshold keeps only the triple-overlap core.
+    body = client.get(
+        f"/api/v1/traces/{tid}/concurrency?min_active=3"
+    ).json()
+    assert body["min_active"] == 3
+    assert body["windows"] == [{
+        "start_ns": base_ns + 40 * ms,
+        "end_ns": base_ns + 60 * ms,
+        "duration_ns": 20 * ms,
+        "peak_active": 3,
+    }]
+    assert body["total_concurrent_ns"] == 20 * ms
+
+
+def test_concurrency_merges_adjacent_windows_and_follows_open_trace(client):
+    tid = "cc-open"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "a", 0, 100, service="svc"),
+        _custom_span(tid, "b", 50, 150, service="svc"),
+    ]})
+    ms = 10**6
+    base_ns = 1577836800 * 10**9 + 60 * 60 * 10**9
+
+    # Open trace: snapshot of what has arrived so far.
+    body = client.get(f"/api/v1/traces/{tid}/concurrency").json()
+    assert body["windows"] == [{
+        "start_ns": base_ns + 50 * ms,
+        "end_ns": base_ns + 100 * ms,
+        "duration_ns": 50 * ms,
+        "peak_active": 2,
+    }]
+
+    # A new span starting exactly where "a" ends extends the qualifying
+    # stretch continuously (b stays active across the seam at 100ms).
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "c", 100, 120, service="svc"),
+    ]})
+    body = client.get(f"/api/v1/traces/{tid}/concurrency").json()
+    assert body["span_count"] == 3
+    assert body["windows"] == [{
+        "start_ns": base_ns + 50 * ms,
+        "end_ns": base_ns + 120 * ms,
+        "duration_ns": 70 * ms,
+        "peak_active": 2,
+    }]
+    assert body["total_concurrent_ns"] == 70 * ms
+
+
+def test_concurrency_works_after_close(client):
+    tid = "cc-closed"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "a", 0, 60, service="svc"),
+        _custom_span(tid, "b", 30, 90, service="svc"),
+    ]})
+    client.post("/api/v1/admin/force-flush")
+
+    resp = client.get(f"/api/v1/traces/{tid}/concurrency?min_active=2")
+    assert resp.status_code == 200
+    body = resp.json()
+    ms = 10**6
+    base_ns = 1577836800 * 10**9 + 60 * 60 * 10**9
+    assert body["windows"] == [{
+        "start_ns": base_ns + 30 * ms,
+        "end_ns": base_ns + 60 * ms,
+        "duration_ns": 30 * ms,
+        "peak_active": 2,
+    }]
+
+
 def test_decisions_survive_engine_restart(client, tmp_path):
     from app.config import Settings
     from app.engine import SamplingEngine
